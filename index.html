@@ -56,9 +56,10 @@
         // Fetch cafe details
         async function fetchCafeDetails(receiverId) {
             try {
+                // CHANGED: We removed 'cafe_name' from the select query
                 const { data, error } = await supabase
                     .from('profiles')
-                    .select('cafe_name, public_key')
+                    .select('public_key')
                     .eq('id', receiverId)
                     .single();
 
@@ -454,7 +455,10 @@
 
             try {
                 const cafeDetails = await fetchCafeDetails(receiverId);
-                state.cafeName = cafeDetails.cafe_name;
+                
+                // CHANGED: We hardcode the name since we aren't fetching it anymore
+                state.cafeName = "Cyber Cafe";
+                
                 state.publicKey = cafeDetails.public_key;
                 render();
             } catch (err) {
