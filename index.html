@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure File Upload</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .drop-zone {
+            border: 2px dashed #cbd5e1;
+            transition: all 0.3s ease;
+        }
+        .drop-zone.dragover {
+            border-color: #3b82f6;
+            background-color: #eff6ff;
+        }
+        @keyframes success-bounce {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+        .success-animation {
+            animation: success-bounce 0.5s ease;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-slate-50 to-slate-100 min-h-screen py-8 px-4">
+    <div id="app" class="max-w-lg mx-auto"></div>
+
+    <script>
+        // Supabase Configuration
+        const SUPABASE_URL = 'https://uqnveapflnfqrtuoaaat.supabase.co';
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVxbnZlYXBmbG5mcXJ0dW9hYWF0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUwMzM1MzAsImV4cCI6MjA4MDYwOTUzMH0.PZKJdjC72ZNTrQPuGQZtMR-F80DuD-JeWzLxtiAHlDI';
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        // App State
+        let state = {
+            receiverId: null,
+            cafeName: null,
+            publicKey: null,
+            senderName: '',
+            selectedFile: null,
+            isConfidential: false,
+            uploading: false,
+            progress: 0,
+            error: null,
+            success: false
+        };
+
+        // Parse receiver ID from URL
+        function getReceiverId() {
+            const params = new URLSearchParams(window.location.search);
+            return params.get('id');
+        }
+
+        // Fetch cafe details
+        async function fetchCafeDetails(receiverId) {
+            try {
+                const { data, error } = await supabase
+                    .from('profiles')
+                    .select('cafe_name, public_key')
+                    .eq('id', receiverId)
+                    .single();
+
+                if (error) throw new Error('Cafe not found');
+                if (!data) throw new Error('Invalid QR code or Cafe ID');
+                
+                return data;
+            } catch (err) {
+                throw new Error('Failed to load cafe details: ' + err.message);
+            }
+        }
+
+        // Crypto Functions
+        async function generateAESKey() {
+            return await crypto.subtle.generateKey(
+                { name: 'AES-CBC', length: 256 },
+                true,
+                ['encrypt']
+            );
+        }
+
+        function generateIV() {
+            return crypto.getRandomValues(new Uint8Array(16));
+        }
+
+        async function encryptFile(file, aesKey, iv) {
+            const fileBuffer = await file.arrayBuffer();
+            const encrypted = await crypto.subtle.encrypt(
+                { name: 'AES-CBC', iv: iv },
+                aesKey,
+                fileBuffer
+            );
+            return new Uint8Array(encrypted);
+        }
+
+        async function importRSAPublicKey(pemKey) {
+            // Remove PEM headers and decode base64
+            const pemContents = pemKey
+                .replace('-----BEGIN PUBLIC KEY-----', '')
+                .replace('-----END PUBLIC KEY-----', '')
+                .replace(/\s/g, '');
+            
+            const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+            
+            return await crypto.subtle.importKey(
+                'spki',
+                binaryDer.buffer,
+                {
+                    name: 'RSA-OAEP',
+                    hash: 'SHA-256'
+                },
+                false,
+                ['encrypt']
+            );
+        }
+
+        async function encryptAESKey(aesKey, rsaPublicKey) {
+            const exportedKey = await crypto.subtle.exportKey('raw', aesKey);
+            const encrypted = await crypto.subtle.encrypt(
+                { name: 'RSA-OAEP' },
+                rsaPublicKey,
+                exportedKey
+            );
+            return new Uint8Array(encrypted);
+        }
+
+        function arrayBufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+        }
+
+        function sanitizeFilename(filename) {
+            return filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+        }
+
+        // Upload Handler
+        async function handleUpload() {
+            if (!state.senderName.trim()) {
+                state.error = 'Please enter your name';
+                render();
+                return;
+            }
+
+            if (!state.selectedFile) {
+                state.error = 'Please select a file';
+                render();
+                return;
+            }
+
+            state.uploading = true;
+            state.error = null;
+            state.progress = 0;
+            render();
+
+            try {
+                // Step A: Generate AES Key
+                updateProgress(10, 'Generating encryption keys...');
+                const aesKey = await generateAESKey();
+
+                // Step B: Generate IV
+                const iv = generateIV();
+
+                // Step C: Encrypt File
+                updateProgress(30, 'Encrypting file...');
+                const encryptedFile = await encryptFile(state.selectedFile, aesKey, iv);
+
+                // Step D: Encrypt AES Key with RSA
+                updateProgress(50, 'Securing encryption key...');
+                const rsaPublicKey = await importRSAPublicKey(state.publicKey);
+                const encryptedAESKey = await encryptAESKey(aesKey, rsaPublicKey);
+
+                // Upload to Storage
+                updateProgress(70, 'Uploading file...');
+                const timestamp = Date.now();
+                const sanitizedFilename = sanitizeFilename(state.selectedFile.name);
+                const storagePath = `${state.receiverId}/${timestamp}_${sanitizedFilename}`;
+
+                const { error: storageError } = await supabase.storage
+                    .from('print_files')
+                    .upload(storagePath, encryptedFile.buffer, {
+                        contentType: 'application/octet-stream',
+                        upsert: false
+                    });
+
+                if (storageError) throw storageError;
+
+                // Insert into Database
+                updateProgress(90, 'Finalizing...');
+                const { error: dbError } = await supabase
+                    .from('print_jobs')
+                    .insert({
+                        receiver_id: state.receiverId,
+                        sender_name: state.senderName.trim(),
+                        file_name: state.selectedFile.name,
+                        storage_path: storagePath,
+                        encrypted_aes_key: arrayBufferToBase64(encryptedAESKey),
+                        iv: arrayBufferToBase64(iv),
+                        is_confidential: state.isConfidential,
+                        status: 'pending'
+                    });
+
+                if (dbError) throw dbError;
+
+                // Success!
+                updateProgress(100, 'Sent successfully!');
+                state.success = true;
+                state.uploading = false;
+                render();
+
+            } catch (err) {
+                state.error = 'Upload failed: ' + err.message;
+                state.uploading = false;
+                render();
+            }
+        }
+
+        function updateProgress(percent, message) {
+            state.progress = percent;
+            render();
+        }
+
+        function resetForm() {
+            state.senderName = '';
+            state.selectedFile = null;
+            state.isConfidential = false;
+            state.success = false;
+            state.error = null;
+            state.progress = 0;
+            render();
+        }
+
+        function handleFileSelect(file) {
+            const validTypes = [
+                'application/pdf',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'application/msword'
+            ];
+
+            if (!validTypes.includes(file.type)) {
+                state.error = 'Please select a PDF or Word document';
+                state.selectedFile = null;
+                render();
+                return;
+            }
+
+            state.selectedFile = file;
+            state.error = null;
+            render();
+        }
+
+        // Render UI
+        function render() {
+            const app = document.getElementById('app');
+
+            if (!state.cafeName) {
+                app.innerHTML = `
+                    <div class="bg-white rounded-2xl shadow-xl p-8 text-center">
+                        <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+                        <p class="mt-4 text-gray-600">Loading cafe details...</p>
+                    </div>
+                `;
+                return;
+            }
+
+            if (state.success) {
+                app.innerHTML = `
+                    <div class="bg-white rounded-2xl shadow-xl p-8 text-center success-animation">
+                        <div class="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <svg class="w-10 h-10 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                            </svg>
+                        </div>
+                        <h2 class="text-2xl font-bold text-gray-900 mb-2">File Sent!</h2>
+                        <p class="text-gray-600 mb-6">Your document has been securely uploaded to ${state.cafeName}</p>
+                        <button onclick="resetForm()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-8 rounded-xl transition-all">
+                            Send Another File
+                        </button>
+                    </div>
+                `;
+                return;
+            }
+
+            app.innerHTML = `
+                <div class="bg-white rounded-2xl shadow-xl p-6 sm:p-8">
+                    <!-- Header -->
+                    <div class="text-center mb-6">
+                        <h1 class="text-2xl sm:text-3xl font-bold text-gray-900 mb-2">Secure File Upload</h1>
+                        <p class="text-gray-600">Sending to <span class="font-semibold text-blue-600">${state.cafeName}</span></p>
+                    </div>
+
+                    <!-- Error Message -->
+                    ${state.error ? `
+                        <div class="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4">
+                            ${state.error}
+                        </div>
+                    ` : ''}
+
+                    <!-- Name Input -->
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Your Name *</label>
+                        <input 
+                            type="text" 
+                            id="senderName"
+                            value="${state.senderName}"
+                            placeholder="Enter your full name"
+                            class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all"
+                            ${state.uploading ? 'disabled' : ''}
+                        />
+                    </div>
+
+                    <!-- File Drop Zone -->
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Document *</label>
+                        <div 
+                            id="dropZone"
+                            class="drop-zone relative bg-gray-50 rounded-xl p-8 text-center cursor-pointer hover:bg-gray-100 transition-all"
+                        >
+                            <input 
+                                type="file" 
+                                id="fileInput" 
+                                accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                class="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                ${state.uploading ? 'disabled' : ''}
+                            />
+                            <svg class="w-12 h-12 text-gray-400 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                            </svg>
+                            ${state.selectedFile ? `
+                                <p class="text-sm font-medium text-gray-900">${state.selectedFile.name}</p>
+                                <p class="text-xs text-gray-500 mt-1">${(state.selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                            ` : `
+                                <p class="text-sm text-gray-600 font-medium">Click to select or drag & drop</p>
+                                <p class="text-xs text-gray-500 mt-1">PDF or Word documents only</p>
+                            `}
+                        </div>
+                    </div>
+
+                    <!-- Confidential Toggle -->
+                    <div class="mb-6">
+                        <label class="flex items-center cursor-pointer">
+                            <input 
+                                type="checkbox" 
+                                id="confidentialToggle"
+                                ${state.isConfidential ? 'checked' : ''}
+                                class="w-5 h-5 text-red-600 border-gray-300 rounded focus:ring-red-500 cursor-pointer"
+                                ${state.uploading ? 'disabled' : ''}
+                            />
+                            <span class="ml-3 text-sm font-medium text-gray-700">
+                                Mark as Confidential
+                                ${state.isConfidential ? '<span class="ml-2 text-xs text-red-600 font-semibold">⚠ CONFIDENTIAL</span>' : ''}
+                            </span>
+                        </label>
+                    </div>
+
+                    <!-- Progress Bar -->
+                    ${state.uploading ? `
+                        <div class="mb-6">
+                            <div class="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+                                <div 
+                                    class="bg-blue-600 h-3 transition-all duration-300 ease-out rounded-full"
+                                    style="width: ${state.progress}%"
+                                ></div>
+                            </div>
+                            <p class="text-sm text-gray-600 text-center mt-2">Uploading... ${state.progress}%</p>
+                        </div>
+                    ` : ''}
+
+                    <!-- Upload Button -->
+                    <button 
+                        id="uploadBtn"
+                        class="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-4 rounded-xl transition-all shadow-lg hover:shadow-xl disabled:cursor-not-allowed"
+                        ${state.uploading ? 'disabled' : ''}
+                    >
+                        ${state.uploading ? 'Encrypting & Sending...' : '🔒 Encrypt & Send'}
+                    </button>
+
+                    <!-- Security Badge -->
+                    <div class="mt-6 text-center">
+                        <p class="text-xs text-gray-500">
+                            <svg class="w-4 h-4 inline mr-1" fill="currentColor" viewBox="0 0 20 20">
+                                <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"></path>
+                            </svg>
+                            End-to-end encrypted with AES-256 + RSA-OAEP
+                        </p>
+                    </div>
+                </div>
+            `;
+
+            // Attach event listeners
+            if (!state.success && !state.uploading) {
+                const senderNameInput = document.getElementById('senderName');
+                senderNameInput?.addEventListener('input', (e) => {
+                    state.senderName = e.target.value;
+                });
+
+                const fileInput = document.getElementById('fileInput');
+                const dropZone = document.getElementById('dropZone');
+
+                fileInput?.addEventListener('change', (e) => {
+                    if (e.target.files.length > 0) {
+                        handleFileSelect(e.target.files[0]);
+                    }
+                });
+
+                dropZone?.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    dropZone.classList.add('dragover');
+                });
+
+                dropZone?.addEventListener('dragleave', () => {
+                    dropZone.classList.remove('dragover');
+                });
+
+                dropZone?.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    dropZone.classList.remove('dragover');
+                    if (e.dataTransfer.files.length > 0) {
+                        handleFileSelect(e.dataTransfer.files[0]);
+                    }
+                });
+
+                const confidentialToggle = document.getElementById('confidentialToggle');
+                confidentialToggle?.addEventListener('change', (e) => {
+                    state.isConfidential = e.target.checked;
+                    render();
+                });
+
+                const uploadBtn = document.getElementById('uploadBtn');
+                uploadBtn?.addEventListener('click', handleUpload);
+            }
+        }
+
+        // Initialize App
+        async function init() {
+            const receiverId = getReceiverId();
+            
+            if (!receiverId) {
+                document.getElementById('app').innerHTML = `
+                    <div class="bg-red-50 border border-red-200 rounded-2xl p-8 text-center">
+                        <h2 class="text-xl font-bold text-red-900 mb-2">Invalid Link</h2>
+                        <p class="text-red-700">Please scan a valid QR code from the cafe.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            state.receiverId = receiverId;
+            render();
+
+            try {
+                const cafeDetails = await fetchCafeDetails(receiverId);
+                state.cafeName = cafeDetails.cafe_name;
+                state.publicKey = cafeDetails.public_key;
+                render();
+            } catch (err) {
+                document.getElementById('app').innerHTML = `
+                    <div class="bg-red-50 border border-red-200 rounded-2xl p-8 text-center">
+                        <h2 class="text-xl font-bold text-red-900 mb-2">Cafe Not Found</h2>
+                        <p class="text-red-700">${err.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        // Start the app
+        init();
+    </script>
+</body>
+</html>
