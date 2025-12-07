@@ -258,7 +258,7 @@
                 const encryptedAESKey = await encryptAESKey(aesKey, rsaPublicKey);
 
                 // Upload to Storage
-                updateProgress(55, 'Uploading Secure Blob...');
+                updateProgress(55, 'Uploading encrypted file...');
                 const timestamp = Date.now();
                 const sanitizedFilename = sanitizeFilename(state.selectedFile.name);
                 const storagePath = `${state.receiverId}/${timestamp}_${sanitizedFilename}`;
