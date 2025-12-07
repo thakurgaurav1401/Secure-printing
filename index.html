@@ -6,6 +6,11 @@
     <title>Secure File Upload</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // Configure pdf.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
     <style>
         .drop-zone {
             border: 2px dashed #cbd5e1;
@@ -43,8 +48,15 @@
             isConfidential: false,
             uploading: false,
             progress: 0,
+            progressMessage: '',
             error: null,
-            success: false
+            success: false,
+            // New features
+            pageCount: null,
+            pageCountLoading: false,
+            pageCountError: null,
+            isColorPrint: false, // false = B/W (₹2), true = Color (₹7)
+            isWordDoc: false
         };
 
         // Parse receiver ID from URL
@@ -139,6 +151,63 @@
             return filename.replace(/[^a-zA-Z0-9._-]/g, '_');
         }
 
+        // Page Count Functions
+        async function countPdfPages(file) {
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                return pdf.numPages;
+            } catch (err) {
+                console.error('PDF page count error:', err);
+                throw new Error('Could not read PDF pages');
+            }
+        }
+
+        async function handlePageCount(file) {
+            const extension = file.name.split('.').pop().toLowerCase();
+            const isWord = ['doc', 'docx'].includes(extension);
+            
+            state.isWordDoc = isWord;
+            state.pageCountLoading = true;
+            state.pageCountError = null;
+            state.pageCount = null;
+            render();
+
+            if (isWord) {
+                // Word docs default to 1 page with disclaimer
+                state.pageCount = 1;
+                state.pageCountLoading = false;
+                render();
+                return;
+            }
+
+            try {
+                const pages = await countPdfPages(file);
+                state.pageCount = pages;
+                state.pageCountLoading = false;
+                render();
+            } catch (err) {
+                state.pageCountError = err.message;
+                state.pageCountLoading = false;
+                render();
+            }
+        }
+
+        function calculateCost() {
+            const rate = state.isColorPrint ? 7 : 2;
+            const pages = state.pageCount || 1;
+            return pages * rate;
+        }
+
+        function handlePayNow() {
+            console.log('Payment clicked');
+            console.log('Details:', {
+                pages: state.pageCount,
+                mode: state.isColorPrint ? 'Color' : 'B/W',
+                cost: calculateCost()
+            });
+        }
+
         // Upload Handler
         async function handleUpload() {
             if (!state.senderName.trim()) {
@@ -156,27 +225,40 @@
             state.uploading = true;
             state.error = null;
             state.progress = 0;
+            state.progressMessage = 'Encrypting & Securing Document...';
             render();
+
+            // Wait for page count if still loading
+            if (state.pageCountLoading) {
+                await new Promise(resolve => {
+                    const checkInterval = setInterval(() => {
+                        if (!state.pageCountLoading) {
+                            clearInterval(checkInterval);
+                            resolve();
+                        }
+                    }, 100);
+                });
+            }
 
             try {
                 // Step A: Generate AES Key
-                updateProgress(10, 'Generating encryption keys...');
+                updateProgress(10, 'Encrypting & Securing Document...');
                 const aesKey = await generateAESKey();
 
                 // Step B: Generate IV
                 const iv = generateIV();
 
                 // Step C: Encrypt File
-                updateProgress(30, 'Encrypting file...');
+                updateProgress(30, 'Encrypting & Securing Document...');
                 const encryptedFile = await encryptFile(state.selectedFile, aesKey, iv);
 
                 // Step D: Encrypt AES Key with RSA
-                updateProgress(50, 'Securing encryption key...');
+                updateProgress(45, 'Encrypting & Securing Document...');
                 const rsaPublicKey = await importRSAPublicKey(state.publicKey);
                 const encryptedAESKey = await encryptAESKey(aesKey, rsaPublicKey);
 
                 // Upload to Storage
-                updateProgress(70, 'Uploading file...');
+                updateProgress(55, 'Uploading Secure Blob...');
                 const timestamp = Date.now();
                 const sanitizedFilename = sanitizeFilename(state.selectedFile.name);
                 const storagePath = `${state.receiverId}/${timestamp}_${sanitizedFilename}`;
@@ -191,7 +273,7 @@
                 if (storageError) throw storageError;
 
                 // Insert into Database
-                updateProgress(90, 'Finalizing...');
+                updateProgress(90, 'Uploading Secure Blob...');
                 const { error: dbError } = await supabase
                     .from('print_jobs')
                     .insert({
@@ -222,6 +304,7 @@
 
         function updateProgress(percent, message) {
             state.progress = percent;
+            state.progressMessage = message;
             render();
         }
 
@@ -232,6 +315,12 @@
             state.success = false;
             state.error = null;
             state.progress = 0;
+            state.progressMessage = '';
+            state.pageCount = null;
+            state.pageCountLoading = false;
+            state.pageCountError = null;
+            state.isColorPrint = false;
+            state.isWordDoc = false;
             render();
         }
 
@@ -251,6 +340,10 @@
 
             state.selectedFile = file;
             state.error = null;
+            
+            // Trigger async page count
+            handlePageCount(file);
+            
             render();
         }
 
@@ -269,6 +362,10 @@
             }
 
             if (state.success) {
+                const estimatedCost = calculateCost();
+                const printMode = state.isColorPrint ? 'Color' : 'Black & White';
+                const ratePerPage = state.isColorPrint ? 7 : 2;
+                
                 app.innerHTML = `
                     <div class="bg-white rounded-2xl shadow-xl p-8 text-center success-animation">
                         <div class="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -278,7 +375,45 @@
                         </div>
                         <h2 class="text-2xl font-bold text-gray-900 mb-2">File Sent!</h2>
                         <p class="text-gray-600 mb-6">Your document has been securely uploaded to ${state.cafeName}</p>
-                        <button onclick="resetForm()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-8 rounded-xl transition-all">
+                        
+                        <!-- Receipt Summary -->
+                        <div class="bg-gray-50 rounded-xl p-4 mb-6 text-left">
+                            <h3 class="text-sm font-semibold text-gray-700 mb-3 text-center uppercase tracking-wide">Print Estimate</h3>
+                            <div class="space-y-2 text-sm">
+                                <div class="flex justify-between">
+                                    <span class="text-gray-600">Document:</span>
+                                    <span class="font-medium text-gray-900 truncate max-w-[180px]">${state.selectedFile?.name || 'N/A'}</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-gray-600">Total Pages:</span>
+                                    <span class="font-medium text-gray-900">${state.pageCount || 1}${state.isWordDoc ? '*' : ''}</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-gray-600">Print Mode:</span>
+                                    <span class="font-medium text-gray-900">${printMode}</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-gray-600">Rate:</span>
+                                    <span class="font-medium text-gray-900">₹${ratePerPage}/page</span>
+                                </div>
+                                <hr class="border-gray-200 my-2">
+                                <div class="flex justify-between text-base">
+                                    <span class="font-semibold text-gray-700">Estimated Cost:</span>
+                                    <span class="font-bold text-green-600">₹${estimatedCost}</span>
+                                </div>
+                            </div>
+                            ${state.isWordDoc ? '<p class="text-xs text-gray-500 mt-3 text-center">*Final page count & cost calculated at counter</p>' : ''}
+                        </div>
+
+                        <!-- Pay Now Button -->
+                        <button 
+                            onclick="handlePayNow()" 
+                            class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-4 rounded-xl transition-all shadow-lg hover:shadow-xl mb-3"
+                        >
+                            💳 Pay Now - ₹${estimatedCost}
+                        </button>
+                        
+                        <button onclick="resetForm()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-8 rounded-xl transition-all">
                             Send Another File
                         </button>
                     </div>
@@ -334,12 +469,61 @@
                             ${state.selectedFile ? `
                                 <p class="text-sm font-medium text-gray-900">${state.selectedFile.name}</p>
                                 <p class="text-xs text-gray-500 mt-1">${(state.selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                                ${state.pageCountLoading ? `
+                                    <p class="text-xs text-blue-600 mt-1 flex items-center justify-center">
+                                        <svg class="animate-spin h-3 w-3 mr-1" viewBox="0 0 24 24">
+                                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle>
+                                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                        </svg>
+                                        Counting pages...
+                                    </p>
+                                ` : state.pageCount ? `
+                                    <p class="text-xs text-green-600 mt-1">📄 ${state.pageCount} page${state.pageCount > 1 ? 's' : ''} detected${state.isWordDoc ? '*' : ''}</p>
+                                    ${state.isWordDoc ? '<p class="text-xs text-gray-400">*Final count at counter</p>' : ''}
+                                ` : state.pageCountError ? `
+                                    <p class="text-xs text-orange-600 mt-1">⚠ Could not count pages</p>
+                                ` : ''}
                             ` : `
                                 <p class="text-sm text-gray-600 font-medium">Click to select or drag & drop</p>
                                 <p class="text-xs text-gray-500 mt-1">PDF or Word documents only</p>
                             `}
                         </div>
                     </div>
+
+                    <!-- Print Mode Toggle -->
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Print Mode</label>
+                        <div class="flex bg-gray-100 rounded-xl p-1">
+                            <button 
+                                type="button"
+                                id="bwModeBtn"
+                                class="flex-1 py-3 px-4 rounded-lg text-sm font-medium transition-all ${!state.isColorPrint ? 'bg-white shadow text-gray-900' : 'text-gray-600 hover:text-gray-900'}"
+                                ${state.uploading ? 'disabled' : ''}
+                            >
+                                <span class="block">Black & White</span>
+                                <span class="text-xs ${!state.isColorPrint ? 'text-blue-600' : 'text-gray-500'}">₹2/page</span>
+                            </button>
+                            <button 
+                                type="button"
+                                id="colorModeBtn"
+                                class="flex-1 py-3 px-4 rounded-lg text-sm font-medium transition-all ${state.isColorPrint ? 'bg-white shadow text-gray-900' : 'text-gray-600 hover:text-gray-900'}"
+                                ${state.uploading ? 'disabled' : ''}
+                            >
+                                <span class="block">Color</span>
+                                <span class="text-xs ${state.isColorPrint ? 'text-blue-600' : 'text-gray-500'}">₹7/page</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Cost Preview (shown when file selected) -->
+                    ${state.selectedFile && state.pageCount ? `
+                        <div class="mb-4 bg-blue-50 border border-blue-200 rounded-xl p-3">
+                            <div class="flex justify-between items-center text-sm">
+                                <span class="text-blue-700">Estimated Cost:</span>
+                                <span class="font-bold text-blue-900">₹${calculateCost()} (${state.pageCount} × ₹${state.isColorPrint ? 7 : 2})</span>
+                            </div>
+                        </div>
+                    ` : ''}
 
                     <!-- Confidential Toggle -->
                     <div class="mb-6">
@@ -367,7 +551,7 @@
                                     style="width: ${state.progress}%"
                                 ></div>
                             </div>
-                            <p class="text-sm text-gray-600 text-center mt-2">Uploading... ${state.progress}%</p>
+                            <p class="text-sm text-gray-600 text-center mt-2">${state.progressMessage} ${state.progress}%</p>
                         </div>
                     ` : ''}
 
@@ -428,6 +612,18 @@
                 const confidentialToggle = document.getElementById('confidentialToggle');
                 confidentialToggle?.addEventListener('change', (e) => {
                     state.isConfidential = e.target.checked;
+                    render();
+                });
+
+                const bwModeBtn = document.getElementById('bwModeBtn');
+                bwModeBtn?.addEventListener('click', () => {
+                    state.isColorPrint = false;
+                    render();
+                });
+
+                const colorModeBtn = document.getElementById('colorModeBtn');
+                colorModeBtn?.addEventListener('click', () => {
+                    state.isColorPrint = true;
                     render();
                 });
 
